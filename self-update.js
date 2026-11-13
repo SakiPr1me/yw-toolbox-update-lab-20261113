@@ -5,7 +5,6 @@ const UNCERTAIN_HOLD_MS = 20 * 60 * 1000;
 const START_GAP_MS = 60000;
 
 export function createSelfUpdater(deps) {
-    const win = deps.window;
     const request = deps.fetch;
     const now = deps.now || Date.now;
     const delay = deps.setTimeout || setTimeout;
