@@ -80,15 +80,13 @@ export function createSelfUpdater(deps) {
                     && (item.type === 'global' || item.type === 'local'));
             }
         } catch (e) { }
-        const urlGlobal = selfUrl.pathname.startsWith('/scripts/extensions/third-party/');
         if (found?.length) {
-            // 同名两份安装时按加载URL的范围优先，结果仍须核对实际加载副本。
-            found.sort((a, b) => Number(b.type === (urlGlobal ? 'global' : 'local')) - Number(a.type === (urlGlobal ? 'global' : 'local')));
+            // 宿主发现接口会优先本地同名安装；两种安装共享URL，不能靠URL猜global。
+            found.sort((a, b) => Number(a.type !== 'local') - Number(b.type !== 'local'));
             return [...new Set(found.map(item => item.type === 'global'))];
         }
-        const memory = read('installation');
-        if (memory && memory.name === folder && typeof memory.global === 'boolean') return [memory.global, !memory.global];
-        return [urlGlobal, !urlGlobal];
+        // 发现失败时不使用可能属于另一用户/旧安装的记忆去更新同名目录。
+        throw new Error('无法确认当前插件的安装位置，请稍后重试');
     }
     function scheduleReload() {
         if (reloadTimer !== null) cancel(reloadTimer);
@@ -147,11 +145,16 @@ export function createSelfUpdater(deps) {
         try { before = await installedVersion(); } catch (e) {
             try { storage.removeItem('kimi_updated_to'); } catch (err) { }
         }
-        const scopes = await locate();
+        let scopes;
+        try { scopes = await locate(); } catch (error) {
+            publish('failed', error.message);
+            notify('warning', state.label, automatic);
+            return snapshot();
+        }
         for (const global of scopes) {
             publish('updating', '正在获取 Git 更新…');
             write('pending', { at: now(), before, global });
-            let waitTimer;
+            let waitTimer, releaseTimer;
             // UI等待超时不取消服务器git任务，也不释放本页flight；晚到响应仍负责最终核验。
             const operation = (async () => {
                 const response = await request('/api/extensions/update', {
@@ -169,19 +172,24 @@ export function createSelfUpdater(deps) {
             })();
             waitTimer = delay(() => publish('uncertain', '服务器仍在处理，暂不重复提交'), REQUEST_WAIT_MS);
             let answer;
-            try { answer = await operation; } catch (error) {
+            const release = new Promise((_, reject) => {
+                releaseTimer = delay(() => reject(new Error('更新等待已超过宿主任务上限')), UNCERTAIN_HOLD_MS);
+            });
+            try { answer = await Promise.race([operation, release]); } catch (error) {
                 const status = error.status;
-                if (status === 400 || status === 403) {
+                if (status === 400 || status === 403 || status === 500) {
+                    // 宿主已明确结束本次请求；下一次显式操作先核盘，不在本轮连发重试。
                     remove('pending');
-                    const label = status === 403 ? '没有更新此安装的权限' : '插件安装信息不正确';
+                    const label = status === 403 ? '没有更新此安装的权限'
+                        : status === 500 ? 'Git 更新失败，请检查网络或仓库后重试' : '插件安装信息不正确';
                     publish('failed', label);
                     notify('error', label, automatic);
                 } else {
-                    publish('uncertain', status === 500 ? 'Git 更新失败，请检查仓库或网络；暂不重复提交' : '更新结果未确认，稍后核对；暂不重复提交');
+                    publish('uncertain', '更新结果未确认，稍后核对；暂不重复提交');
                     notify('warning', state.label, automatic);
                 }
                 return snapshot();
-            } finally { cancel(waitTimer); }
+            } finally { cancel(waitTimer); cancel(releaseTimer); }
             if (answer.missing) { remove('pending'); continue; }
             try { return await verifyResult(answer.result, automatic); } catch (error) {
                 publish('uncertain', '已收到更新结果，但版本未能核实');
